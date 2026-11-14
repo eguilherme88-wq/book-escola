@@ -1,9 +1,9 @@
 {
-  "id": "./",
+  "id": "./book-escola-app",
   "name": "book-escola",
   "short_name": "book-escola",
   "lang": "pt-BR",
-  "start_url": "./",
+  "start_url": "./?app=book-escola",
   "scope": "./",
   "display": "standalone",
   "background_color": "#f5f5fc",
@@ -21,5 +21,7 @@
       "type": "image/png",
       "purpose": "any"
     }
-  ]
+  ],
+  "description": "Portal educacional book-escola para professores, alunos e administração.",
+  "prefer_related_applications": false
 }
