@@ -679,4 +679,209 @@ if(migrateData(db))persist();
 for(const read of db.reads){const m=db.materials.find(m=>m.id===read.material);if(isVideo(m)&&!videoRecord(read.student,m.id))db.videoProgress.push({id:uid(),student:read.student,material:m.id,course:m.course,openedAt:read.date+'T12:00:00',finishedAt:read.date+'T12:00:00',method:'legacy-declared'});}
 
 render();
-</script></body></html>
+</script><script type="module">
+/* ================================================================
+   book-escola · Banco de dados Firebase (Cloud Firestore)
+   ----------------------------------------------------------------
+   1. Cole abaixo a configuração do seu projeto Firebase
+      (Console do Firebase → Configurações do projeto → Seus apps → Web).
+   2. Enquanto apiKey estiver vazio, o app continua funcionando
+      só com o armazenamento local do navegador, como antes.
+   ================================================================ */
+const FIREBASE_CONFIG = {
+  apiKey: "AIzaSyCPKOOAMDyB9Uwyt23KUk7S5MI6xui8Jaw",
+  authDomain: "book-escola.firebaseapp.com",
+  projectId: "book-escola",
+  storageBucket: "book-escola.firebasestorage.app",
+  messagingSenderId: "145098553452",
+  appId: "1:145098553452:web:0ebf925a07ebcdfd8bc049"
+};
+/* Identificador da escola no banco. Todos os dados ficam em escolas/{ESCOLA_ID}/... */
+const ESCOLA_ID = "book-escola";
+const SDK = "https://www.gstatic.com/firebasejs/13.4.0";
+
+if (FIREBASE_CONFIG.apiKey) startCloud().catch(err => {
+  console.error("[Firebase]", err);
+  cloudStatus("erro", "Sem conexão com o banco na nuvem. Os dados continuam salvos neste navegador.");
+});
+
+async function startCloud() {
+  const { initializeApp } = await import(`${SDK}/firebase-app.js`);
+  const { getAuth, signInAnonymously } = await import(`${SDK}/firebase-auth.js`);
+  const fs = await import(`${SDK}/firebase-firestore.js`);
+  const { initializeFirestore, persistentLocalCache, persistentMultipleTabManager,
+          doc, collection, getDoc, getDocs, setDoc, onSnapshot, writeBatch, serverTimestamp } = fs;
+
+  const app = initializeApp(FIREBASE_CONFIG);
+  await signInAnonymously(getAuth(app));
+  const fdb = initializeFirestore(app, {
+    ignoreUndefinedProperties: true,
+    localCache: persistentLocalCache({ tabManager: persistentMultipleTabManager() })
+  });
+
+  const rootRef = doc(fdb, "escolas", ESCOLA_ID);
+  const MAX_DOC = 900 * 1024;            // limite do Firestore é 1 MiB por documento
+  const lastSynced = new Map();          // "colecao/id" -> JSON do último estado igual à nuvem
+  const remote = new Map();              // colecao -> Map(id -> item com _ord)
+  const listeners = new Map();
+  const dirtyKeys = new Set();
+  let syncTimer = null, applyTimer = null, syncing = Promise.resolve(), warnedBig = new Set();
+
+  /* ---------- conversão objeto do app <-> documentos ---------- */
+  const hasNestedArray = v => Array.isArray(v)
+    ? v.some(x => Array.isArray(x) || hasNestedArray(x))
+    : (v && typeof v === "object" ? Object.values(v).some(hasNestedArray) : false);
+  const encode = (value, extra) => {
+    const clean = JSON.parse(JSON.stringify(value ?? null));
+    if (clean !== null && typeof clean === "object" && !Array.isArray(clean) && !hasNestedArray(clean)) return { ...clean, ...extra };
+    return { _json: JSON.stringify(clean), ...extra };   // formatos que o Firestore não aceita direto
+  };
+  const decode = data => {
+    const { _ord, _json, ...rest } = data;
+    return _json !== undefined ? JSON.parse(_json) : rest;
+  };
+  const docIdOf = (item, i) => (item && typeof item === "object" && typeof item.id === "string" && item.id && !item.id.includes("/"))
+    ? item.id : `_idx_${i}`;
+
+  /* Estado atual do app transformado em documentos: { "colecao/id": {key, id, data, json} } */
+  function snapshotLocal() {
+    const out = new Map(), arrayKeys = [], metaKeys = [];
+    for (const [key, value] of Object.entries(db)) {
+      if (Array.isArray(value)) {
+        arrayKeys.push(key);
+        value.forEach((item, i) => {
+          const id = docIdOf(item, i);
+          const data = encode(item, { _ord: i });
+          out.set(`${key}/${id}`, { key, id, data, json: JSON.stringify(data) });
+        });
+      } else {
+        metaKeys.push(key);
+        const data = { _json: JSON.stringify(value ?? null) };
+        out.set(`_meta/${key}`, { key: "_meta", id: key, data, json: JSON.stringify(data) });
+      }
+    }
+    return { out, arrayKeys, metaKeys };
+  }
+
+  /* ---------- envio: grava só o que mudou ---------- */
+  async function syncNow() {
+    clearTimeout(syncTimer); syncTimer = null;
+    const { out, arrayKeys, metaKeys } = snapshotLocal();
+    const ops = [];
+    for (const [path, d] of out) {
+      if (lastSynced.get(path) === d.json) continue;
+      if (d.json.length > MAX_DOC) {
+        if (!warnedBig.has(path)) { warnedBig.add(path); toast("Um item é grande demais para o banco na nuvem (limite de 1 MB) e ficou salvo só neste navegador."); }
+        continue;
+      }
+      ops.push(["set", d.key, d.id, d.data, path, d.json]);
+    }
+    for (const path of lastSynced.keys()) if (!out.has(path)) {
+      const [key, ...rest] = path.split("/"); ops.push(["del", key, rest.join("/"), null, path]);
+    }
+    const rootChanged = JSON.stringify([arrayKeys, metaKeys]) !== lastSynced.get("_root");
+    if (!ops.length && !rootChanged) return;
+    for (let i = 0; i < ops.length || (i === 0 && rootChanged); i += 450) {
+      const batch = writeBatch(fdb);
+      for (const [op, key, id, data, path, json] of ops.slice(i, i + 450)) {
+        const ref = doc(fdb, "escolas", ESCOLA_ID, key, id);
+        if (op === "set") { batch.set(ref, data); lastSynced.set(path, json); }
+        else { batch.delete(ref); lastSynced.delete(path); }
+      }
+      if (i === 0) batch.set(rootRef, { arrayKeys, metaKeys, updatedAt: serverTimestamp() }, { merge: true });
+      batch.commit().catch(err => { console.error("[Firebase] gravação", err); cloudStatus("erro", "Não foi possível salvar na nuvem. Os dados continuam neste navegador."); });
+    }
+    lastSynced.set("_root", JSON.stringify([arrayKeys, metaKeys]));
+    cloudStatus("ok");
+  }
+  function scheduleSync() { clearTimeout(syncTimer); syncTimer = setTimeout(() => { syncing = syncing.then(syncNow); }, 700); }
+
+  /* ---------- recebimento: alterações vindas de outros aparelhos ---------- */
+  const modalOpen = () => document.querySelector("#modal")?.open || document.activeElement?.closest?.("dialog");
+  function applyRemote() {
+    clearTimeout(applyTimer);
+    if (!dirtyKeys.size) return;
+    if (syncTimer) { syncNow(); }                          // envia primeiro o que foi editado aqui
+    if (modalOpen()) { applyTimer = setTimeout(applyRemote, 1500); return; }   // espera fechar a janela de edição
+    const candidate = structuredClone(db);
+    for (const key of dirtyKeys) {
+      const items = remote.get(key) || new Map();
+      if (key === "_meta") {
+        for (const [id, data] of items) candidate[id] = JSON.parse(data._json);
+      } else {
+        candidate[key] = [...items.values()].sort((a, b) => (a._ord ?? 0) - (b._ord ?? 0)).map(decode);
+      }
+    }
+    if (typeof validBackup === "function" && !validBackup(candidate)) { console.warn("[Firebase] dados remotos inválidos ignorados"); dirtyKeys.clear(); return; }
+    for (const key of dirtyKeys) for (const [id, data] of remote.get(key) || []) {
+      lastSynced.set(`${key}/${id}`, JSON.stringify(data));
+    }
+    dirtyKeys.clear();
+    try { localStorage.setItem(KEY, JSON.stringify(candidate)); } catch (e) {}
+    if (!refreshLocalData(true)) { db = candidate; render(); }
+  }
+  function listen(key) {
+    if (listeners.has(key)) return;
+    remote.set(key, new Map());
+    listeners.set(key, onSnapshot(collection(fdb, "escolas", ESCOLA_ID, key), snap => {
+      const map = remote.get(key);
+      let fromOthers = false;
+      for (const ch of snap.docChanges()) {
+        if (ch.type === "removed") map.delete(ch.doc.id); else map.set(ch.doc.id, ch.doc.data());
+        const path = `${key}/${ch.doc.id}`;
+        const json = ch.type === "removed" ? undefined : JSON.stringify(ch.doc.data());
+        if (!ch.doc.metadata.hasPendingWrites && lastSynced.get(path) !== json) fromOthers = true;
+      }
+      if (fromOthers) { dirtyKeys.add(key); clearTimeout(applyTimer); applyTimer = setTimeout(applyRemote, 300); }
+    }, err => console.error("[Firebase] leitura", key, err)));
+  }
+
+  /* ---------- primeira carga ---------- */
+  const root = await getDoc(rootRef);
+  if (!root.exists()) {
+    // Banco vazio: envia os dados que já existem neste navegador (migração inicial).
+    await syncNow();
+    toast("Banco de dados criado no Firebase com os dados deste navegador.");
+  } else {
+    const { arrayKeys = [], metaKeys = [] } = root.data();
+    const candidate = structuredClone(db);
+    for (const key of arrayKeys) {
+      const snap = await getDocs(collection(fdb, "escolas", ESCOLA_ID, key));
+      const items = snap.docs.map(d => { lastSynced.set(`${key}/${d.id}`, JSON.stringify(d.data())); return d.data(); });
+      candidate[key] = items.sort((a, b) => (a._ord ?? 0) - (b._ord ?? 0)).map(decode);
+    }
+    const metaSnap = await getDocs(collection(fdb, "escolas", ESCOLA_ID, "_meta"));
+    metaSnap.forEach(d => { lastSynced.set(`_meta/${d.id}`, JSON.stringify(d.data())); if (metaKeys.includes(d.id)) candidate[d.id] = JSON.parse(d.data()._json); });
+    if (typeof migrateData === "function") migrateData(candidate);
+    if (typeof validBackup === "function" && !validBackup(candidate)) throw Error("Dados do Firebase incompatíveis com o app");
+    try { localStorage.setItem(KEY, JSON.stringify(candidate)); } catch (e) {}
+    if (!refreshLocalData(true)) { db = candidate; if (user) user = db.users.find(u => u.id === user.id && u.active) || null; render(); }
+    lastSynced.set("_root", JSON.stringify([arrayKeys, metaKeys]));
+    scheduleSync();                                      // envia ajustes feitos por migrateData, se houver
+  }
+  cloudStatus("ok");
+
+  /* ---------- liga o app ao banco ---------- */
+  const localPersist = window.persist;
+  window.persist = function () { const ok = localPersist.apply(this, arguments); scheduleSync(); return ok; };
+  const keysNow = () => [...Object.keys(db).filter(k => Array.isArray(db[k])), "_meta"];
+  keysNow().forEach(listen);
+  onSnapshot(rootRef, s => { (s.data()?.arrayKeys || []).forEach(listen); keysNow().forEach(listen); });
+  addEventListener("storage", ev => { if (ev.key === KEY) scheduleSync(); });
+  addEventListener("pagehide", () => { if (syncTimer) syncNow(); });
+  window.bookEscolaCloud = { syncNow, status: () => ({ docs: lastSynced.size }) };
+}
+
+function cloudStatus(state, msg) {
+  let el = document.getElementById("cloud-status");
+  if (!el) {
+    el = document.createElement("div"); el.id = "cloud-status";
+    el.style.cssText = "position:fixed;left:12px;bottom:12px;z-index:9999;padding:4px 10px;border-radius:999px;font:12px system-ui,sans-serif;background:rgba(0,0,0,.65);color:#fff;pointer-events:none";
+    document.body.appendChild(el);
+  }
+  el.textContent = state === "ok" ? "☁ Sincronizado com Firebase" : "☁ Offline — salvo neste navegador";
+  el.title = msg || "";
+  if (state === "erro" && msg && typeof toast === "function") toast(msg);
+}
+</script>
+</body></html>
